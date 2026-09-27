@@ -49,7 +49,12 @@ var (
 	dnsAttemptTimeouts = []time.Duration{4 * time.Second, 5 * time.Second, 6 * time.Second}
 )
 
-var errStall = errors.New("rldp: no response header in time")
+// ErrStall: connected, but no response header within RLDPHeaderTimeout.
+var ErrStall = errors.New("rldp: no response header in time")
+
+// A client that produced a header for another request this recently is a slow endpoint, not a
+// dead peer: the stalled request fails, the connection is kept.
+var recentHeaderGrace = 5 * time.Second
 
 // flight is one in-progress operation that any number of requests may wait on.
 type flight struct {
@@ -287,13 +292,21 @@ func (t *Transport) site(host string) *siteInfo {
 }
 
 // actorFor returns a usable actor for the host, connecting in a background flight if needed.
-// fresh forces a new DHT lookup and a new connection (after a stall).
-func (t *Transport) actorFor(ctx context.Context, host string, fresh bool) (any, error) {
+// stalled is the client a request just gave up on: if the site's current client is a different
+// live one (another request already reconnected), that one is used; otherwise a new DHT lookup
+// and a new connection are made.
+func (t *Transport) actorFor(ctx context.Context, host string, stalled RLDP) (any, error) {
 	s := t.site(host)
+	fresh := stalled != nil
 	for {
 		s.mx.Lock()
 		now := time.Now().Unix()
 		prevUsed := atomic.SwapInt64(&s.LastUsed, now)
+		if fresh {
+			if act, ok := s.Actor.(*rldpInfo); ok && act.ActiveClient != nil && act.ActiveClient != stalled {
+				fresh = false // someone reconnected since this request's client stalled
+			}
+		}
 		if !fresh {
 			switch act := s.Actor.(type) {
 			case *bagInfo:
@@ -346,6 +359,15 @@ func (t *Transport) connectFlight(s *siteInfo, host string, f *flight, fresh boo
 	}
 
 	s.mx.Lock()
+	if err == nil && s.connecting != f {
+		// superseded after running past its budget: a newer flight owns the site; do not
+		// install over it, and release what this one built
+		s.mx.Unlock()
+		teardown(actor)
+		f.err = errors.New("connect superseded")
+		close(f.done)
+		return
+	}
 	if err == nil {
 		if prev, ok := s.Actor.(*rldpInfo); ok && prev != actor && prev.ActiveClient != nil {
 			prev.ActiveClient.Close() // upstream leaked the old client on every re-resolve
@@ -386,7 +408,7 @@ func (t *Transport) connect(ctx context.Context, host string, old any, fresh boo
 	}
 
 	if inStorage {
-		return t.startBag(host, id)
+		return t.startBag(ctx, host, id)
 	}
 
 	list, pubKey, err := t.findAddresses(ctx, id, fresh)
@@ -422,7 +444,7 @@ func (t *Transport) connect(ctx context.Context, host string, old any, fresh boo
 	return nil, fmt.Errorf("failed to connect to rldp servers %s of host %s, err: %w", tried, host, err)
 }
 
-func (t *Transport) startBag(host string, id []byte) (any, error) {
+func (t *Transport) startBag(ctx context.Context, host string, id []byte) (any, error) {
 	torrent := storage.NewTorrent("", t.store, t.storageConnector)
 	torrent.BagID = id
 	_ = t.store.SetTorrent(torrent)
@@ -430,13 +452,48 @@ func (t *Transport) startBag(host string, id []byte) (any, error) {
 	if err := torrent.Start(StorageUpload, false, false); err != nil {
 		return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
 	}
-	downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
-	if err != nil {
-		torrent.Stop()
-		return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
+
+	// The downloader lives as long as the bag (global context), but finding it may take long:
+	// wait only as long as the connect budget, and if it gives up, clean up when it finishes.
+	type result struct {
+		d   storage.TorrentDownloader
+		err error
 	}
-	log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag started")
-	return &bagInfo{torrent: torrent, downloader: downloader}, nil
+	ch := make(chan result, 1)
+	go func() {
+		d, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
+		ch <- result{d, err}
+	}()
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			torrent.Stop()
+			return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, r.err)
+		}
+		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag started")
+		return &bagInfo{torrent: torrent, downloader: r.d}, nil
+	case <-ctx.Done():
+		go func() {
+			if r := <-ch; r.d != nil {
+				r.d.Close()
+			}
+			torrent.Stop()
+		}()
+		return nil, fmt.Errorf("storage bag of %s: no downloader in time: %w", host, ctx.Err())
+	}
+}
+
+// teardown releases an actor that will not be used.
+func teardown(actor any) {
+	switch a := actor.(type) {
+	case *rldpInfo:
+		if a.ActiveClient != nil {
+			a.ActiveClient.Close()
+		}
+	case *bagInfo:
+		a.downloader.Close()
+		a.torrent.Stop()
+	}
 }
 
 // dropClient forgets a client that stalled so the next request reconnects.

@@ -80,6 +80,7 @@ type siteInfo struct {
 
 type rldpInfo struct {
 	ActiveClient RLDP
+	lastHeaderAt int64 // unix nanos of the last response header on ActiveClient
 
 	ID     ed25519.PublicKey
 	NodeID []byte // the site's ADNL id (DHT key)
@@ -292,10 +293,10 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	retryable := (request.Method == http.MethodGet || request.Method == http.MethodHead) &&
 		(request.Body == nil || request.Body == http.NoBody)
 
-	fresh := false
+	var stalled RLDP
 	for attempt := 0; ; attempt++ {
 		tm := time.Now()
-		actor, err := t.actorFor(request.Context(), host, fresh)
+		actor, err := t.actorFor(request.Context(), host, stalled)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to site: %w", err)
 		}
@@ -315,11 +316,11 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 		case *rldpInfo:
 			client := act.ActiveClient
 			if client == nil { // dropped between actorFor and here
-				fresh = true
 				continue
 			}
 			resp, err := t.doRldpHttp(client, host, request)
 			if err == nil {
+				atomic.StoreInt64(&act.lastHeaderAt, time.Now().UnixNano())
 				if attempt > 0 {
 					metrics.rldpRetryOK.Add(1)
 				}
@@ -327,13 +328,18 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 				atomic.StoreInt64(&t.site(host).LastSuccess, time.Now().Unix())
 				return resp, nil
 			}
-			if errors.Is(err, errStall) {
+			if errors.Is(err, ErrStall) {
 				metrics.rldpStall.Add(1)
+				if time.Since(time.Unix(0, atomic.LoadInt64(&act.lastHeaderAt))) < recentHeaderGrace {
+					// the connection answered another request just now: slow page, live peer
+					metrics.rldpFail.Add(1)
+					return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
+				}
 				// The connection is not answering: forget it and its DHT address, then try
 				// once more from a fresh lookup (maybe the site moved, maybe the peer died).
 				t.dropClient(host, act, client)
 				if retryable && attempt == 0 && request.Context().Err() == nil {
-					fresh = true
+					stalled = client
 					continue
 				}
 			}
@@ -573,7 +579,7 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	hcancel()
 	if err != nil {
 		if request.Context().Err() == nil && errors.Is(hctx.Err(), context.DeadlineExceeded) {
-			return nil, errStall
+			return nil, ErrStall
 		}
 		return nil, fmt.Errorf("failed to query http over rldp: %w", err)
 	}

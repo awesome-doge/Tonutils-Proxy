@@ -24,6 +24,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strings"
@@ -125,8 +126,8 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	if err != nil {
 		text := err.Error()
 		// ton2web fork: say why, so the gateway can tell our own failure from the site's
-		wr.Header().Set("X-Tonutils-Error", errorKind(text))
-		if strings.Contains(text, "context deadline exceeded") || strings.Contains(text, "no response header in time") {
+		wr.Header().Set("X-Tonutils-Error", errorKind(err))
+		if strings.Contains(text, "context deadline exceeded") || errors.Is(err, transport.ErrStall) {
 			http.Error(wr, "TON Site "+req.URL.Host+" is not responding.", http.StatusBadGateway)
 		} else {
 			http.Error(wr, "RLDP Proxy Error:\n"+text, http.StatusBadGateway)
@@ -145,21 +146,30 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	io.Copy(wr, resp.Body)
 }
 
-// errorKind classifies a transport error for the X-Tonutils-Error header.
-func errorKind(text string) string {
+// errorKind classifies a transport error for the X-Tonutils-Error header. It looks at the
+// inner error, not the formatted url.Error, whose text contains the host name (a site called
+// "xstorage.ton" must not read as a storage failure).
+func errorKind(err error) string {
+	var uerr *url.Error
+	if errors.As(err, &uerr) {
+		err = uerr.Err
+	}
 	switch {
-	case strings.Contains(text, "no response header in time"):
+	case errors.Is(err, transport.ErrStall):
 		return "stall" // connected, but the site did not answer (after one fresh retry)
-	case strings.Contains(text, "no such dns record") || strings.Contains(text, "resolve err"):
+	case errors.Is(err, dns.ErrNoSuchRecord):
 		return "no-record" // the name has no site record
+	case errors.Is(err, context.Canceled):
+		return "canceled"
+	}
+	text := err.Error()
+	switch {
 	case strings.Contains(text, "resolve domain"):
 		return "resolve" // our DNS lookup failed
 	case strings.Contains(text, "in DHT"):
 		return "dht" // the site's address is not in the DHT
-	case strings.Contains(text, "storage"):
+	case strings.Contains(text, "storage bag"):
 		return "storage"
-	case strings.Contains(text, "context canceled"):
-		return "canceled"
 	case strings.Contains(text, "deadline exceeded"):
 		return "timeout"
 	default:

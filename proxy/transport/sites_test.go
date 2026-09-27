@@ -69,15 +69,32 @@ func (d *fakeDHT) Close() {}
 
 // fakeRLDP answers the HTTP request header query, or stalls until the ctx ends.
 type fakeRLDP struct {
-	addr   string
-	stall  bool
-	closed atomic.Bool
+	addr     string
+	stall    bool
+	closed   atomic.Bool
+	mx       sync.Mutex
+	onDiscon func()
 }
 
-func (f *fakeRLDP) Close()                                     { f.closed.Store(true) }
+// Close fires the disconnect handler asynchronously, as the real ADNL gateway does.
+func (f *fakeRLDP) Close() {
+	if f.closed.Swap(true) {
+		return
+	}
+	f.mx.Lock()
+	h := f.onDiscon
+	f.mx.Unlock()
+	if h != nil {
+		go h()
+	}
+}
 func (f *fakeRLDP) SetOnQuery(func([]byte, *rldp.Query) error) {}
-func (f *fakeRLDP) SetOnDisconnect(func())                     {}
-func (f *fakeRLDP) GetADNL() rldp.ADNL                         { return nil }
+func (f *fakeRLDP) SetOnDisconnect(h func()) {
+	f.mx.Lock()
+	f.onDiscon = h
+	f.mx.Unlock()
+}
+func (f *fakeRLDP) GetADNL() rldp.ADNL { return nil }
 func (f *fakeRLDP) SendAnswer(context.Context, uint64, uint32, []byte, []byte, tl.Serializable) error {
 	return nil
 }
@@ -231,7 +248,7 @@ func TestOneConnectForManyConcurrentRequests(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := tr.actorFor(context.Background(), "a.ton", false); err != nil {
+			if _, err := tr.actorFor(context.Background(), "a.ton", nil); err != nil {
 				t.Error(err)
 			}
 		}()
@@ -251,7 +268,7 @@ func TestAWaiterGivesUpWithoutBlockingOthers(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	tm := time.Now()
-	if _, err := tr.actorFor(ctx, "a.ton", false); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := tr.actorFor(ctx, "a.ton", nil); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("want deadline, got %v", err)
 	}
 	if d := time.Since(tm); d > 100*time.Millisecond {
@@ -260,7 +277,7 @@ func TestAWaiterGivesUpWithoutBlockingOthers(t *testing.T) {
 	// the connect kept going in the background: the next request finds the site ready
 	time.Sleep(400 * time.Millisecond)
 	tm = time.Now()
-	if _, err := tr.actorFor(context.Background(), "a.ton", false); err != nil {
+	if _, err := tr.actorFor(context.Background(), "a.ton", nil); err != nil {
 		t.Fatal(err)
 	}
 	if d := time.Since(tm); d > 50*time.Millisecond {
@@ -316,10 +333,113 @@ func TestPostIsNotRetriedAfterAStall(t *testing.T) {
 	req.Host = "a.ton"
 	req.Body = http.NoBody
 	req.Method = http.MethodPost
-	if _, err := tr.RoundTrip(req); !errors.Is(err, errStall) {
+	if _, err := tr.RoundTrip(req); !errors.Is(err, ErrStall) {
 		t.Fatalf("want stall error, got %v", err)
 	}
 	if dials.Load() != 1 {
 		t.Fatalf("dials = %d; a POST must not be sent twice", dials.Load())
+	}
+}
+
+// dialWithDisconnect wires the real removeRLDP handler, as connectRLDP does.
+func dialWithDisconnect(tr *Transport, mk func(addr string) *fakeRLDP, dials *atomic.Int32) func(ed25519.PublicKey, string, string) (RLDP, error) {
+	return func(_ ed25519.PublicKey, addr, host string) (RLDP, error) {
+		dials.Add(1)
+		c := mk(addr)
+		c.SetOnDisconnect(tr.removeRLDP(c, host))
+		return c, nil
+	}
+}
+
+func TestASecondStallOnTheOldClientDoesNotKillTheNewOne(t *testing.T) {
+	dht := &fakeDHT{addrs: []string{"1.2.3.4:1", "5.6.7.8:2"}}
+	tr := newTestTransport(okResolver(t, time.Millisecond), dht)
+	defer tr.stop()
+	var dials atomic.Int32
+	var mu sync.Mutex
+	var made []*fakeRLDP
+	tr.dialRLDP = dialWithDisconnect(tr, func(addr string) *fakeRLDP {
+		mu.Lock()
+		defer mu.Unlock()
+		c := &fakeRLDP{addr: addr}
+		made = append(made, c)
+		return c
+	}, &dials)
+
+	first, err := tr.actorFor(context.Background(), "a.ton", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientX := first.(*rldpInfo).ActiveClient
+	// request A stalled on clientX and reconnected
+	tr.dropClient("a.ton", first.(*rldpInfo), clientX)
+	second, err := tr.actorFor(context.Background(), "a.ton", clientX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientY := second.(*rldpInfo).ActiveClient
+	// request B, also on clientX, stalls later: it must get clientY, not a third connection
+	third, err := tr.actorFor(context.Background(), "a.ton", clientX)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.(*rldpInfo).ActiveClient != clientY || dials.Load() != 2 {
+		t.Fatalf("dials = %d; B's stall reconnected again and would close A's new client", dials.Load())
+	}
+	time.Sleep(20 * time.Millisecond) // let async disconnect handlers run
+	if clientY.(*fakeRLDP).closed.Load() {
+		t.Fatal("the live client was closed")
+	}
+}
+
+func TestASlowPageOnALiveConnectionDoesNotDropIt(t *testing.T) {
+	old := RLDPHeaderTimeout
+	RLDPHeaderTimeout = 50 * time.Millisecond
+	defer func() { RLDPHeaderTimeout = old }()
+
+	tr := newTestTransport(okResolver(t, time.Millisecond), &fakeDHT{addrs: []string{"1.2.3.4:1"}})
+	defer tr.stop()
+	var dials atomic.Int32
+	tr.dialRLDP = dialWithDisconnect(tr, func(addr string) *fakeRLDP { return &fakeRLDP{addr: addr} }, &dials)
+
+	get := func() (*http.Response, error) {
+		req, _ := http.NewRequest(http.MethodGet, "http://a.ton/", nil)
+		req.Host = "a.ton"
+		return tr.RoundTrip(req)
+	}
+	if _, err := get(); err != nil { // header arrives: lastHeaderAt set
+		t.Fatal(err)
+	}
+	act, _ := tr.actorFor(context.Background(), "a.ton", nil)
+	act.(*rldpInfo).ActiveClient.(*fakeRLDP).stall = true // this page is slow
+	if _, err := get(); !errors.Is(err, ErrStall) {
+		t.Fatalf("want stall, got %v", err)
+	}
+	if dials.Load() != 1 || act.(*rldpInfo).ActiveClient == nil {
+		t.Fatalf("dials = %d; a connection that answered moments ago was dropped", dials.Load())
+	}
+}
+
+func TestStallRetryWithTheRealDisconnectHandler(t *testing.T) {
+	old := RLDPHeaderTimeout
+	RLDPHeaderTimeout = 50 * time.Millisecond
+	defer func() { RLDPHeaderTimeout = old }()
+
+	tr := newTestTransport(okResolver(t, time.Millisecond), &fakeDHT{addrs: []string{"1.2.3.4:1", "5.6.7.8:2"}})
+	defer tr.stop()
+	var dials atomic.Int32
+	tr.dialRLDP = dialWithDisconnect(tr, func(addr string) *fakeRLDP {
+		return &fakeRLDP{addr: addr, stall: addr == "1.2.3.4:1"}
+	}, &dials)
+	req, _ := http.NewRequest(http.MethodGet, "http://a.ton/", nil)
+	req.Host = "a.ton"
+	resp, err := tr.RoundTrip(req)
+	if err != nil || resp.StatusCode != 200 {
+		t.Fatalf("want 200, got %v %v", resp, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	act, _ := tr.actorFor(context.Background(), "a.ton", nil)
+	if c := act.(*rldpInfo).ActiveClient; c == nil || c.(*fakeRLDP).addr != "5.6.7.8:2" {
+		t.Fatal("the old client's disconnect handler removed the new client")
 	}
 }
