@@ -34,6 +34,8 @@ type counters struct {
 	dhtOK         *expvar.Int
 	dhtFail       *expvar.Int
 	headerMs      *expvar.Map // time to RLDP response header
+	dhtMs         *expvar.Map // DHT address lookup
+	waitMs        *expvar.Map // a request waiting for its site to be ready (0 when warm)
 }
 
 var metrics = counters{
@@ -56,6 +58,8 @@ var metrics = counters{
 	dhtOK:         expvar.NewInt("dht_ok"),
 	dhtFail:       expvar.NewInt("dht_fail"),
 	headerMs:      expvar.NewMap("rldp_header_ms"),
+	dhtMs:         expvar.NewMap("dht_ms"),
+	waitMs:        expvar.NewMap("site_wait_ms"),
 }
 
 func init() {
@@ -72,7 +76,7 @@ func init() {
 	expvar.Publish("goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
 
-var buckets = []int64{250, 500, 1000, 2000, 4000, 8000, 16000}
+var buckets = []int64{10, 100, 250, 500, 1000, 2000, 4000, 8000, 16000}
 
 func bucket(d time.Duration) string {
 	ms := d.Milliseconds()

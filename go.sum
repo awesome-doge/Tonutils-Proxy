@@ -18,6 +18,8 @@ github.com/MarvinJWendt/testza v0.4.2/go.mod h1:mSdhXiKH8sg/gQehJ63bINcCKp7RtYew
 github.com/MarvinJWendt/testza v0.5.2 h1:53KDo64C1z/h/d/stCYCPY69bt/OSwjq5KpFNwi+zB4=
 github.com/MarvinJWendt/testza v0.5.2/go.mod h1:xu53QFE5sCdjtMCKk8YMQ2MnymimEctc4n3EjyIYvEY=
 github.com/atomicgo/cursor v0.0.1/go.mod h1:cBON2QmmrysudxNBFthvMtN32r3jxVRIvzkUiF/RuIk=
+github.com/awesome-doge/tonutils-go v0.0.0-20260927104020-0cc7e245052f h1:xvaBixtshUzSuWHvz9eCiTQcZo5VCo6KTIJibjfHuuQ=
+github.com/awesome-doge/tonutils-go v0.0.0-20260927104020-0cc7e245052f/go.mod h1:3/B8mS5IWLTd1xbGbFbzRem55oz/Q86HG884bVsTqZ8=
 github.com/beorn7/perks v1.0.1 h1:VlbKKnNfV8bJzeqoa4cOKqO6bYr3WgKZxO8Z16+hsOM=
 github.com/beorn7/perks v1.0.1/go.mod h1:G2ZrVWU2WbWT9wwq4/hrbKbnv/1ERSJQ0ibhJ6rlkpw=
 github.com/cespare/xxhash/v2 v2.3.0 h1:UL815xU9SqsFlibzuggzjXhog7bL6oX9BbNZnL2UFvs=
@@ -119,8 +121,6 @@ github.com/xssnick/raptorq v1.3.0 h1:3GoaySKMg/i8rbjhIuqjxpTTO2l3Gs2/Gh7k3GAjvGo
 github.com/xssnick/raptorq v1.3.0/go.mod h1:kgEVVsZv2hP+IeV7C7985KIFsDdvYq2ARW234SBA9Q4=
 github.com/xssnick/ton-payment-network v1.2.3 h1:5/uR6YhnlCrOz+EJN8guG+qeAgGxbc15kbxNeub/3+I=
 github.com/xssnick/ton-payment-network v1.2.3/go.mod h1:K+YwyIjyrtCcKfZ0EIbk81n85ctu6YXEn+do9NwQQJs=
-github.com/xssnick/tonutils-go v1.15.5 h1:yAcHnDaY5QW0aIQE47lT0PuDhhHYE+N+NyZssdPKR0s=
-github.com/xssnick/tonutils-go v1.15.5/go.mod h1:3/B8mS5IWLTd1xbGbFbzRem55oz/Q86HG884bVsTqZ8=
 github.com/xssnick/tonutils-storage v1.3.1 h1:NSrUzd8qCUdWWSQZ0wiuZ7wW3apPsixtRjyQJQLkDi0=
 github.com/xssnick/tonutils-storage v1.3.1/go.mod h1:D4WHEeFmMkPQ3ArB146+RRjF5MyAfbtyuBQ7MU8JDno=
 github.com/yuin/goldmark v1.4.13/go.mod h1:6yULJ656Px+3vBD8DxQVa3kxgyrAnzto9xy5taEt/CY=

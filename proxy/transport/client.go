@@ -301,6 +301,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 	for attempt := 0; ; attempt++ {
 		tm := time.Now()
 		actor, err := t.actorFor(request.Context(), host, stalled)
+		metrics.waitMs.Add(bucket(time.Since(tm)), 1)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connect to site: %w", err)
 		}

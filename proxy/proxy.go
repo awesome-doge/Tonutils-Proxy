@@ -248,7 +248,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	})
 
 	log.Info().Msg("Initializing DNS resolver...")
-	connPool, dnsClient, err := initDNSResolver(lsCfg)
+	connPool, dnsClient, dnsAPI, err := initDNSResolver(lsCfg)
 	if err != nil {
 		return fmt.Errorf("failed to init TON DNS resolver: %w", err)
 	}
@@ -450,7 +450,7 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 		State: "Starting HTTP server...",
 	})
 
-	t := transport.NewTransport(gateProxy, dhtClient, dnsClient, conn, store)
+	t := transport.NewTransport(gateProxy, dhtClient, newFastResolver(ctx, dnsAPI, dnsClient), conn, store)
 	client = &http.Client{
 		Transport: t,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -510,13 +510,13 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 	return err
 }
 
-func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, *dns.Client, error) {
+func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, *dns.Client, *ton.APIClient, error) {
 	pool := liteclient.NewConnectionPool()
 
 	// connect to testnet lite server
 	err := pool.AddConnectionsFromConfig(context.Background(), cfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
 	// initialize ton api lite connection wrapper
@@ -533,8 +533,8 @@ func initDNSResolver(cfg *liteclient.GlobalConfig) (*liteclient.ConnectionPool, 
 		break
 	}
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 
-	return pool, dns.NewDNSClient(api, root), nil
+	return pool, dns.NewDNSClient(api, root), api, nil
 }

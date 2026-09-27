@@ -44,3 +44,5 @@ require (
 	golang.org/x/text v0.29.0 // indirect
 	google.golang.org/protobuf v1.36.6 // indirect
 )
+
+replace github.com/xssnick/tonutils-go => github.com/awesome-doge/tonutils-go v0.0.0-20260927104020-0cc7e245052f

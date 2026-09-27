@@ -39,7 +39,8 @@ var (
 	DNSUsableFor       = 24 * time.Hour
 	DNSNotFoundFor     = 2 * time.Minute
 	DNSLookupBudget    = 12 * time.Second
-	DHTFreshFor        = 5 * time.Minute
+	DHTFreshFor        = 30 * time.Minute
+	DHTUsableFor       = 24 * time.Hour
 	ConnectBudget      = 30 * time.Second
 	RLDPHeaderTimeout  = 10 * time.Second
 	SiteIdleEvict      = 15 * time.Minute
@@ -243,23 +244,50 @@ func (t *Transport) resolveDNS(ctx context.Context, host string) (*dns.Domain, e
 // ---- DHT address cache ----
 
 type dhtRecord struct {
-	list *address.List
-	key  ed25519.PublicKey
-	at   time.Time
+	list       *address.List
+	key        ed25519.PublicKey
+	at         time.Time
+	refreshing bool
 }
 
+// findAddresses returns a server's addresses from the DHT. Measured on 2026-09-27, most lookups
+// take 0.25-1 s but some take 4-16 s, so results are kept: fresh for DHTFreshFor, then still used
+// (with a background refresh) up to DHTUsableFor. A stall forces a fresh lookup (fresh=true).
 func (t *Transport) findAddresses(ctx context.Context, id []byte, fresh bool) (*address.List, ed25519.PublicKey, error) {
 	k := hex.EncodeToString(id)
 	if !fresh {
-		t.mx.RLock()
+		t.mx.Lock()
 		r := t.dhtCache[k]
-		t.mx.RUnlock()
-		if r != nil && time.Since(r.at) < DHTFreshFor {
-			metrics.dhtCacheHit.Add(1)
-			return r.list, r.key, nil
+		if r != nil {
+			age := time.Since(r.at)
+			if age < DHTUsableFor {
+				if age >= DHTFreshFor && !r.refreshing {
+					r.refreshing = true
+					go func() {
+						c, cancel := context.WithTimeout(t.globalCtx, ConnectBudget)
+						defer cancel()
+						_, _, _ = t.lookupDHT(c, id, k)
+						t.mx.Lock()
+						if cur := t.dhtCache[k]; cur != nil {
+							cur.refreshing = false
+						}
+						t.mx.Unlock()
+					}()
+				}
+				t.mx.Unlock()
+				metrics.dhtCacheHit.Add(1)
+				return r.list, r.key, nil
+			}
 		}
+		t.mx.Unlock()
 	}
+	return t.lookupDHT(ctx, id, k)
+}
+
+func (t *Transport) lookupDHT(ctx context.Context, id []byte, k string) (*address.List, ed25519.PublicKey, error) {
+	tm := time.Now()
 	list, key, err := t.dht.FindAddresses(ctx, id)
+	metrics.dhtMs.Add(bucket(time.Since(tm)), 1)
 	if err != nil {
 		metrics.dhtFail.Add(1)
 		return nil, nil, err
