@@ -22,6 +22,7 @@ type counters struct {
 	rldpFail      *expvar.Int
 	bagRequests   *expvar.Int
 	connectOK     *expvar.Int
+	serverReuse   *expvar.Int
 	connectFail   *expvar.Int
 	dnsCacheHit   *expvar.Int
 	dnsCacheStale *expvar.Int
@@ -42,6 +43,7 @@ var metrics = counters{
 	rldpFail:      expvar.NewInt("rldp_fail"),
 	bagRequests:   expvar.NewInt("bag_requests"),
 	connectOK:     expvar.NewInt("connect_ok"),
+	serverReuse:   expvar.NewInt("server_reuse"), // a site joined a server that already had a client
 	connectFail:   expvar.NewInt("connect_fail"),
 	dnsCacheHit:   expvar.NewInt("dns_cache_hit"),
 	dnsCacheStale: expvar.NewInt("dns_cache_stale"),

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net"
@@ -53,7 +54,7 @@ type fakeDHT struct {
 func (d *fakeDHT) StoreAddress(context.Context, address.List, time.Duration, ed25519.PrivateKey, int) (int, []byte, error) {
 	return 0, nil, nil
 }
-func (d *fakeDHT) FindAddresses(ctx context.Context, _ []byte) (*address.List, ed25519.PublicKey, error) {
+func (d *fakeDHT) FindAddresses(ctx context.Context, id []byte) (*address.List, ed25519.PublicKey, error) {
 	d.calls.Add(1)
 	l := &address.List{}
 	for _, a := range d.addrs {
@@ -62,7 +63,8 @@ func (d *fakeDHT) FindAddresses(ctx context.Context, _ []byte) (*address.List, e
 		fmt.Sscan(port, &p)
 		l.Addresses = append(l.Addresses, &address.UDP{IP: net.ParseIP(host), Port: p})
 	}
-	pub, _, _ := ed25519.GenerateKey(nil)
+	seed := sha256.Sum256(id) // one server key per ADNL id, as in the real DHT
+	pub := ed25519.NewKeyFromSeed(seed[:]).Public().(ed25519.PublicKey)
 	return l, pub, nil
 }
 func (d *fakeDHT) Close() {}
@@ -117,6 +119,7 @@ func newTestTransport(res Resolver, dht DHT) *Transport {
 		activeSites:    map[string]*siteInfo{},
 		dns:            newDNSCache(),
 		dhtCache:       map[string]*dhtRecord{},
+		servers:        map[string]*serverClient{},
 	}
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
 	return t
@@ -343,10 +346,10 @@ func TestPostIsNotRetriedAfterAStall(t *testing.T) {
 
 // dialWithDisconnect wires the real removeRLDP handler, as connectRLDP does.
 func dialWithDisconnect(tr *Transport, mk func(addr string) *fakeRLDP, dials *atomic.Int32) func(ed25519.PublicKey, string, string) (RLDP, error) {
-	return func(_ ed25519.PublicKey, addr, host string) (RLDP, error) {
+	return func(key ed25519.PublicKey, addr, host string) (RLDP, error) {
 		dials.Add(1)
 		c := mk(addr)
-		c.SetOnDisconnect(tr.removeRLDP(c, host))
+		c.SetOnDisconnect(tr.removeServer(hex.EncodeToString(key), c))
 		return c, nil
 	}
 }
@@ -441,5 +444,61 @@ func TestStallRetryWithTheRealDisconnectHandler(t *testing.T) {
 	act, _ := tr.actorFor(context.Background(), "a.ton", nil)
 	if c := act.(*rldpInfo).ActiveClient; c == nil || c.(*fakeRLDP).addr != "5.6.7.8:2" {
 		t.Fatal("the old client's disconnect handler removed the new client")
+	}
+}
+
+// The 2026-09-27 finding: 23 of 71 directory sites share 6 servers. One client per server, or
+// the sites on it take each other's replies away.
+func TestSitesOnOneServerShareOneClient(t *testing.T) {
+	tr := newTestTransport(okResolver(t, time.Millisecond), &fakeDHT{addrs: []string{"1.2.3.4:1"}})
+	defer tr.stop()
+	var dials atomic.Int32
+	tr.dialRLDP = dialWithDisconnect(tr, func(addr string) *fakeRLDP { return &fakeRLDP{addr: addr} }, &dials)
+
+	var wg sync.WaitGroup
+	for _, h := range []string{"a.ton", "b.ton", "c.ton", "d.ton"} { // okResolver gives them all testID
+		wg.Add(1)
+		go func(h string) {
+			defer wg.Done()
+			if _, err := tr.actorFor(context.Background(), h, nil); err != nil {
+				t.Error(err)
+			}
+		}(h)
+	}
+	wg.Wait()
+	if dials.Load() != 1 {
+		t.Fatalf("four sites on one server made %d clients; each would steal the others' replies", dials.Load())
+	}
+}
+
+func TestAStallOnASharedServerReconnectsItsSitesOnce(t *testing.T) {
+	old := RLDPHeaderTimeout
+	RLDPHeaderTimeout = 50 * time.Millisecond
+	defer func() { RLDPHeaderTimeout = old }()
+
+	tr := newTestTransport(okResolver(t, time.Millisecond), &fakeDHT{addrs: []string{"1.2.3.4:1", "5.6.7.8:2"}})
+	defer tr.stop()
+	var dials atomic.Int32
+	tr.dialRLDP = dialWithDisconnect(tr, func(addr string) *fakeRLDP {
+		return &fakeRLDP{addr: addr, stall: addr == "1.2.3.4:1"}
+	}, &dials)
+	for _, h := range []string{"a.ton", "b.ton"} {
+		if _, err := tr.actorFor(context.Background(), h, nil); err != nil {
+			t.Fatal(err)
+		}
+	}
+	req, _ := http.NewRequest(http.MethodGet, "http://a.ton/", nil)
+	req.Host = "a.ton"
+	if resp, err := tr.RoundTrip(req); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("a.ton: %v %v", resp, err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	req2, _ := http.NewRequest(http.MethodGet, "http://b.ton/", nil)
+	req2.Host = "b.ton"
+	if resp, err := tr.RoundTrip(req2); err != nil || resp.StatusCode != 200 {
+		t.Fatalf("b.ton after its server reconnected: %v %v", resp, err)
+	}
+	if dials.Load() != 2 {
+		t.Fatalf("dials = %d; want 2 (the dead client once, the new one shared)", dials.Load())
 	}
 }

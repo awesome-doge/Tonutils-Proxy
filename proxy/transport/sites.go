@@ -277,6 +277,58 @@ func (t *Transport) forgetAddresses(id []byte) {
 	t.mx.Unlock()
 }
 
+// ---- one client per server ----
+//
+// Many .ton sites share one server (same ADNL key): on 2026-09-27, 23 of the 71 directory sites
+// were on 6 servers. The gateway keeps ONE peer per key, and every RLDP client made on a peer
+// takes over its message handler. Upstream made a client per SITE, so on a shared server only
+// the most recently connected site got answers; the others hung until a 15 s timeout (and when
+// one was closed, the peer closed under all of them). Here a server has one client, shared by
+// its sites; the request's Host header says which site is meant.
+
+type serverClient struct {
+	rl           RLDP
+	key          string
+	lastHeaderAt int64 // unix nanos of the last response header, any site
+	lastUsed     int64 // unix seconds
+}
+
+// serverFor returns the server's shared client, making it on first use.
+func (t *Transport) serverFor(pubKey ed25519.PublicKey, addr, host string) (*serverClient, error) {
+	k := hex.EncodeToString(pubKey)
+	t.mx.Lock()
+	defer t.mx.Unlock()
+	if sc := t.servers[k]; sc != nil {
+		metrics.serverReuse.Add(1)
+		return sc, nil
+	}
+	// dialRLDP is local (registers the peer, no network), so holding t.mx is cheap and makes
+	// sure two sites on one server never create two clients.
+	rl, err := t.dialRLDP(pubKey, addr, host)
+	if err != nil {
+		return nil, err
+	}
+	sc := &serverClient{rl: rl, key: k, lastUsed: time.Now().Unix()}
+	t.servers[k] = sc
+	return sc, nil
+}
+
+func (t *Transport) closeIdleServers(now int64) {
+	var idle []*serverClient
+	t.mx.Lock()
+	for k, sc := range t.servers {
+		if now-atomic.LoadInt64(&sc.lastUsed) > int64(SiteIdleEvict.Seconds()) {
+			delete(t.servers, k)
+			idle = append(idle, sc)
+		}
+	}
+	t.mx.Unlock()
+	for _, sc := range idle {
+		t.clearClient(sc.rl)
+		sc.rl.Close()
+	}
+}
+
 // ---- connecting a site ----
 
 // site returns (creating if needed) the state for a host.
@@ -314,6 +366,9 @@ func (t *Transport) actorFor(ctx context.Context, host string, stalled RLDP) (an
 				return act, nil
 			case *rldpInfo:
 				if act.ActiveClient != nil {
+					if act.server != nil {
+						atomic.StoreInt64(&act.server.lastUsed, now)
+					}
 					if now-prevUsed > 30 {
 						// as upstream: an idle ADNL channel is re-established on next use (local, cheap)
 						if p, ok := act.ActiveClient.GetADNL().(adnl.Peer); ok {
@@ -369,9 +424,7 @@ func (t *Transport) connectFlight(s *siteInfo, host string, f *flight, fresh boo
 		return
 	}
 	if err == nil {
-		if prev, ok := s.Actor.(*rldpInfo); ok && prev != actor && prev.ActiveClient != nil {
-			prev.ActiveClient.Close() // upstream leaked the old client on every re-resolve
-		}
+		// the previous client is NOT closed here: it may be the server's shared client
 		s.Actor = actor
 		atomic.StoreInt64(&s.LastSuccess, time.Now().Unix())
 	}
@@ -433,13 +486,13 @@ func (t *Transport) connect(ctx context.Context, host string, old any, fresh boo
 	for i := 0; i < len(list.Addresses); i++ {
 		v := list.Addresses[(start+i)%len(list.Addresses)]
 		addr := fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
-		client, cerr := t.dialRLDP(pubKey, addr, host)
+		sc, cerr := t.serverFor(pubKey, addr, host)
 		if cerr != nil {
 			tried = append(tried, addr)
 			err = cerr
 			continue
 		}
-		return &rldpInfo{ActiveClient: client, ID: pubKey, NodeID: id, Addr: addr}, nil
+		return &rldpInfo{ActiveClient: sc.rl, server: sc, ID: pubKey, NodeID: id, Addr: addr}, nil
 	}
 	return nil, fmt.Errorf("failed to connect to rldp servers %s of host %s, err: %w", tried, host, err)
 }
@@ -487,23 +540,24 @@ func (t *Transport) startBag(ctx context.Context, host string, id []byte) (any, 
 func teardown(actor any) {
 	switch a := actor.(type) {
 	case *rldpInfo:
-		if a.ActiveClient != nil {
-			a.ActiveClient.Close()
-		}
+		// shared with the server's other sites: nothing to release
 	case *bagInfo:
 		a.downloader.Close()
 		a.torrent.Stop()
 	}
 }
 
-// dropClient forgets a client that stalled so the next request reconnects.
+// dropClient forgets a server client that stalled: removed from the map at once (so no request
+// can pick up the dead one), detached from every site on that server, then closed.
 func (t *Transport) dropClient(host string, act *rldpInfo, client RLDP) {
-	s := t.site(host)
-	s.mx.Lock()
-	if cur, ok := s.Actor.(*rldpInfo); ok && cur == act && act.ActiveClient == client {
-		act.ActiveClient = nil
+	if act.server != nil {
+		t.mx.Lock()
+		if sc := t.servers[act.server.key]; sc != nil && sc.rl == client {
+			delete(t.servers, act.server.key)
+		}
+		t.mx.Unlock()
 	}
-	s.mx.Unlock()
+	t.clearClient(client)
 	client.Close()
 	t.forgetAddresses(act.NodeID)
 }

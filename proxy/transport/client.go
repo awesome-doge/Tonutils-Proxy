@@ -80,7 +80,7 @@ type siteInfo struct {
 
 type rldpInfo struct {
 	ActiveClient RLDP
-	lastHeaderAt int64 // unix nanos of the last response header on ActiveClient
+	server       *serverClient // the shared client ActiveClient belongs to
 
 	ID     ed25519.PublicKey
 	NodeID []byte // the site's ADNL id (DHT key)
@@ -97,6 +97,7 @@ type Transport struct {
 	activeSites map[string]*siteInfo
 	dns         *dnsCache
 	dhtCache    map[string]*dhtRecord
+	servers     map[string]*serverClient // one RLDP client per server key (see sites.go)
 	dialRLDP    func(key ed25519.PublicKey, addr, host string) (RLDP, error)
 
 	activeRequests map[string]*payloadStream
@@ -116,6 +117,7 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn stor
 		activeSites:      map[string]*siteInfo{},
 		dns:              newDNSCache(),
 		dhtCache:         map[string]*dhtRecord{},
+		servers:          map[string]*serverClient{},
 	}
 	t.dialRLDP = t.connectRLDP
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
@@ -156,17 +158,17 @@ func (t *Transport) cleaner() {
 						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
 					}
 				case *rldpInfo:
-					// upstream never evicted RLDP sites: the map and their ADNL peers only grew
+					// upstream never evicted RLDP sites: the map only grew. The server's client
+					// may serve other sites, so it is closed separately, when the SERVER is idle.
 					if idle > int64(SiteIdleEvict.Seconds()) && info.connecting == nil {
 						t.forgetSite(s, info)
-						if act.ActiveClient != nil {
-							act.ActiveClient.Close()
-						}
+						_ = act
 					}
 				}
 				info.mx.Unlock()
 			}
 		}
+		t.closeIdleServers(now)
 	}
 }
 
@@ -186,35 +188,37 @@ func (t *Transport) connectRLDP(key ed25519.PublicKey, addr, host string) (RLDP,
 
 	r := newRLDP(a)
 	r.SetOnQuery(t.getRLDPQueryHandler(r))
-	r.SetOnDisconnect(t.removeRLDP(r, host))
+	r.SetOnDisconnect(t.removeServer(hex.EncodeToString(key), r))
 
 	return r, nil
 }
 
-func (t *Transport) removeRLDP(rl RLDP, host string) func() {
+// removeServer runs when a server's client disconnects: forget it, and every site that used it.
+func (t *Transport) removeServer(key string, rl RLDP) func() {
 	return func() {
-		t.mx.RLock()
-		r := t.activeSites[host]
-		t.mx.RUnlock()
-
-		if r == nil {
-			return
+		t.mx.Lock()
+		if sc := t.servers[key]; sc != nil && sc.rl == rl {
+			delete(t.servers, key)
 		}
-
-		r.mx.Lock()
-		defer r.mx.Unlock()
-
-		if act, ok := r.Actor.(*rldpInfo); ok {
-			act.destroyClient(rl)
-		}
+		t.mx.Unlock()
+		t.clearClient(rl)
 	}
 }
 
-func (r *rldpInfo) destroyClient(rl RLDP) {
-	rl.Close()
-
-	if r.ActiveClient == rl {
-		r.ActiveClient = nil
+// clearClient detaches a (dead) client from every site that uses it, so they reconnect.
+func (t *Transport) clearClient(rl RLDP) {
+	t.mx.RLock()
+	sites := make([]*siteInfo, 0, len(t.activeSites))
+	for _, s := range t.activeSites {
+		sites = append(sites, s)
+	}
+	t.mx.RUnlock()
+	for _, s := range sites {
+		s.mx.Lock()
+		if act, ok := s.Actor.(*rldpInfo); ok && act.ActiveClient == rl {
+			act.ActiveClient = nil
+		}
+		s.mx.Unlock()
 	}
 }
 
@@ -320,7 +324,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 			}
 			resp, err := t.doRldpHttp(client, host, request)
 			if err == nil {
-				atomic.StoreInt64(&act.lastHeaderAt, time.Now().UnixNano())
+				atomic.StoreInt64(&act.server.lastHeaderAt, time.Now().UnixNano())
 				if attempt > 0 {
 					metrics.rldpRetryOK.Add(1)
 				}
@@ -330,7 +334,7 @@ func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err erro
 			}
 			if errors.Is(err, ErrStall) {
 				metrics.rldpStall.Add(1)
-				if time.Since(time.Unix(0, atomic.LoadInt64(&act.lastHeaderAt))) < recentHeaderGrace {
+				if time.Since(time.Unix(0, atomic.LoadInt64(&act.server.lastHeaderAt))) < recentHeaderGrace {
 					// the connection answered another request just now: slow page, live peer
 					metrics.rldpFail.Add(1)
 					return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
