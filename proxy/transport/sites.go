@@ -376,6 +376,7 @@ func (t *Transport) actorFor(ctx context.Context, host string, stalled RLDP) (an
 					if idleFor > 30 {
 						// as upstream: an idle ADNL channel is re-established on next use (local, cheap)
 						if p, ok := act.ActiveClient.GetADNL().(adnl.Peer); ok {
+							metrics.adnlReinit.Add(1)
 							p.Reinit()
 						}
 					}
