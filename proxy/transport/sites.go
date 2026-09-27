@@ -366,10 +366,14 @@ func (t *Transport) actorFor(ctx context.Context, host string, stalled RLDP) (an
 				return act, nil
 			case *rldpInfo:
 				if act.ActiveClient != nil {
+					// Re-establish an idle ADNL channel on next use (as upstream) — but judged by the
+					// SERVER's shared peer: resetting it because one of its sites was idle would cut
+					// off transfers other sites on the same server have in flight.
+					idleFor := now - prevUsed
 					if act.server != nil {
-						atomic.StoreInt64(&act.server.lastUsed, now)
+						idleFor = now - atomic.SwapInt64(&act.server.lastUsed, now)
 					}
-					if now-prevUsed > 30 {
+					if idleFor > 30 {
 						// as upstream: an idle ADNL channel is re-established on next use (local, cheap)
 						if p, ok := act.ActiveClient.GetADNL().(adnl.Peer); ok {
 							p.Reinit()
