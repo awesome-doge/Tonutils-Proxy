@@ -7,6 +7,8 @@ package transport
 import (
 	"errors"
 	"expvar"
+	"os"
+	"runtime"
 	"time"
 
 	"github.com/xssnick/tonutils-go/ton/dns"
@@ -50,6 +52,20 @@ var metrics = counters{
 	dhtOK:         expvar.NewInt("dht_ok"),
 	dhtFail:       expvar.NewInt("dht_fail"),
 	headerMs:      expvar.NewMap("rldp_header_ms"),
+}
+
+func init() {
+	// Open file descriptors and goroutines: on 2026-09-27 upstream held ~2,200 sockets in the
+	// CLOSED state after 38 days (likely tonutils-go liteclient not closing a TCP connection when
+	// the handshake fails, retried every 3 s). Watch the trend here rather than guess.
+	expvar.Publish("open_fds", expvar.Func(func() any {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return -1
+		}
+		return len(entries)
+	}))
+	expvar.Publish("goroutines", expvar.Func(func() any { return runtime.NumGoroutine() }))
 }
 
 var buckets = []int64{250, 500, 1000, 2000, 4000, 8000, 16000}
