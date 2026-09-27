@@ -42,6 +42,7 @@ var (
 	DHTFreshFor        = 30 * time.Minute
 	DHTUsableFor       = 24 * time.Hour
 	ConnectBudget      = 30 * time.Second
+	BagStartBudget     = 12 * time.Second
 	RLDPHeaderTimeout  = 10 * time.Second
 	SiteIdleEvict      = 15 * time.Minute
 	BagIdleStop        = 5 * time.Minute
@@ -451,7 +452,7 @@ func (t *Transport) connectFlight(s *siteInfo, host string, f *flight, fresh boo
 		// superseded after running past its budget: a newer flight owns the site; do not
 		// install over it, and release what this one built
 		s.mx.Unlock()
-		teardown(actor)
+		t.teardown(actor)
 		f.err = errors.New("connect superseded")
 		close(f.done)
 		return
@@ -539,45 +540,68 @@ func (t *Transport) startBag(ctx context.Context, host string, id []byte) (any, 
 		return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
 	}
 
-	// The downloader lives as long as the bag (global context), but finding it may take long:
-	// wait only as long as the connect budget, and if it gives up, clean up when it finishes.
+	// CreateDownloader polls every 10 ms until it finds a storage node for the bag or its context
+	// ends (tonutils-storage client.go). Upstream passed the process-lifetime context, so every bag
+	// nobody seeds left a goroutine waking 100 times a second, forever — a weekly scan probes
+	// hundreds of such bags. Here the search has its own context: BagStartBudget, then cancelled.
+	// On success the downloader keeps it (it lives as long as the bag; cancel runs when it stops).
+	dctx, cancel := context.WithCancel(t.globalCtx)
 	type result struct {
 		d   storage.TorrentDownloader
 		err error
 	}
 	ch := make(chan result, 1)
 	go func() {
-		d, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
+		d, err := t.storageConnector.CreateDownloader(dctx, torrent)
 		ch <- result{d, err}
 	}()
+	fail := func(err error) (any, error) {
+		cancel()
+		torrent.Stop()
+		t.store.RemoveTorrent(id)
+		metrics.bagStartFail.Add(1)
+		return nil, err
+	}
+	budget := time.NewTimer(BagStartBudget)
+	defer budget.Stop()
 	select {
 	case r := <-ch:
 		if r.err != nil {
-			torrent.Stop()
-			return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, r.err)
+			return fail(fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, r.err))
 		}
 		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag started")
-		return &bagInfo{torrent: torrent, downloader: r.d}, nil
+		metrics.bagStartOK.Add(1)
+		return &bagInfo{torrent: torrent, downloader: r.d, cancel: cancel}, nil
+	case <-budget.C:
 	case <-ctx.Done():
-		go func() {
-			if r := <-ch; r.d != nil {
-				r.d.Close()
-			}
-			torrent.Stop()
-		}()
-		return nil, fmt.Errorf("storage bag of %s: no downloader in time: %w", host, ctx.Err())
 	}
+	cancel() // stops the polling; CreateDownloader returns an error
+	go func() {
+		if r := <-ch; r.d != nil {
+			r.d.Close()
+		}
+	}()
+	return fail(fmt.Errorf("storage bag of %s: no downloader in time: %w", host, context.DeadlineExceeded))
 }
 
 // teardown releases an actor that will not be used.
-func teardown(actor any) {
+func (t *Transport) teardown(actor any) {
 	switch a := actor.(type) {
 	case *rldpInfo:
 		// shared with the server's other sites: nothing to release
 	case *bagInfo:
-		a.downloader.Close()
-		a.torrent.Stop()
+		t.stopBag(a)
 	}
+}
+
+// stopBag releases everything a started bag holds.
+func (t *Transport) stopBag(a *bagInfo) {
+	a.downloader.Close()
+	a.torrent.Stop()
+	if a.cancel != nil {
+		a.cancel()
+	}
+	t.store.RemoveTorrent(a.torrent.BagID)
 }
 
 // dropClient forgets a server client that stalled: removed from the map at once (so no request

@@ -21,6 +21,8 @@ type counters struct {
 	rldpRetryOK   *expvar.Int
 	rldpFail      *expvar.Int
 	bagRequests   *expvar.Int
+	bagStartOK    *expvar.Int
+	bagStartFail  *expvar.Int
 	connectOK     *expvar.Int
 	serverReuse   *expvar.Int
 	adnlReinit    *expvar.Int
@@ -45,6 +47,8 @@ var metrics = counters{
 	rldpRetryOK:   expvar.NewInt("rldp_retry_ok"),
 	rldpFail:      expvar.NewInt("rldp_fail"),
 	bagRequests:   expvar.NewInt("bag_requests"),
+	bagStartOK:    expvar.NewInt("bag_start_ok"),
+	bagStartFail:  expvar.NewInt("bag_start_fail"),
 	connectOK:     expvar.NewInt("connect_ok"),
 	serverReuse:   expvar.NewInt("server_reuse"), // a site joined a server that already had a client
 	adnlReinit:    expvar.NewInt("adnl_reinit"),

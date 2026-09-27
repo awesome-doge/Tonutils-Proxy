@@ -49,6 +49,18 @@ func (v *VirtualStorage) GetTorrentByOverlay(overlay []byte) *storage.Torrent {
 	return v.torrents[string(overlay)]
 }
 
+// RemoveTorrent forgets a bag (ton2web fork): upstream only ever added to this map, so every bag
+// the gateway was asked for stayed in memory for the life of the process.
+func (v *VirtualStorage) RemoveTorrent(bagID []byte) {
+	id, err := tl.Hash(keys.PublicKeyOverlay{Key: bagID})
+	if err != nil {
+		return
+	}
+	v.mx.Lock()
+	delete(v.torrents, string(id))
+	v.mx.Unlock()
+}
+
 func (v *VirtualStorage) SetTorrent(t *storage.Torrent) error {
 	id, err := tl.Hash(keys.PublicKeyOverlay{Key: t.BagID})
 	if err != nil {

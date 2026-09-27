@@ -61,6 +61,7 @@ type ADNL interface {
 type bagInfo struct {
 	torrent    *storage.Torrent
 	downloader storage.TorrentDownloader
+	cancel     context.CancelFunc // ends the downloader's search context (ton2web fork)
 }
 
 var newRLDP = func(a ADNL) RLDP {
@@ -153,8 +154,7 @@ func (t *Transport) cleaner() {
 					// stop bags that were not used for BagIdleStop
 					if idle > int64(BagIdleStop.Seconds()) {
 						t.forgetSite(s, info)
-						act.downloader.Close()
-						act.torrent.Stop()
+						t.stopBag(act)
 						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
 					}
 				case *rldpInfo:
