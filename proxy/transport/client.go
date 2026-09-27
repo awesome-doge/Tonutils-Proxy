@@ -67,19 +67,23 @@ var newRLDP = func(a ADNL) RLDP {
 	return rldp.NewClientV2(a)
 }
 
+// siteInfo is one host's connection state. mx guards the fields and is never held across
+// network I/O (ton2web fork; see sites.go).
 type siteInfo struct {
 	Actor any
 
 	LastUsed    int64
 	LastSuccess int64
-	mx          sync.RWMutex
+	connecting  *flight
+	mx          sync.Mutex
 }
 
 type rldpInfo struct {
 	ActiveClient RLDP
 
-	ID   ed25519.PublicKey
-	Addr string
+	ID     ed25519.PublicKey
+	NodeID []byte // the site's ADNL id (DHT key)
+	Addr   string
 }
 
 type Transport struct {
@@ -90,6 +94,9 @@ type Transport struct {
 	gate             *adnl.Gateway
 
 	activeSites map[string]*siteInfo
+	dns         *dnsCache
+	dhtCache    map[string]*dhtRecord
+	dialRLDP    func(key ed25519.PublicKey, addr, host string) (RLDP, error)
 
 	activeRequests map[string]*payloadStream
 	globalCtx      context.Context
@@ -106,7 +113,10 @@ func NewTransport(gate *adnl.Gateway, dht DHT, resolver Resolver, storeConn stor
 		store:            store,
 		activeRequests:   map[string]*payloadStream{},
 		activeSites:      map[string]*siteInfo{},
+		dns:              newDNSCache(),
+		dhtCache:         map[string]*dhtRecord{},
 	}
+	t.dialRLDP = t.connectRLDP
 	t.globalCtx, t.stop = context.WithCancel(context.Background())
 	go t.cleaner()
 	return t
@@ -134,25 +144,37 @@ func (t *Transport) cleaner() {
 		now := time.Now().Unix()
 		for s, info := range sites {
 			if info.mx.TryLock() {
-				// stop bags that was not used for > 5 min
-				if atomic.LoadInt64(&info.LastUsed)+300 < now {
-					switch act := info.Actor.(type) {
-					case *bagInfo:
-						t.mx.Lock()
-						if t.activeSites[s] == info {
-							delete(t.activeSites, s)
-						}
-						t.mx.Unlock()
+				idle := now - atomic.LoadInt64(&info.LastUsed)
+				switch act := info.Actor.(type) {
+				case *bagInfo:
+					// stop bags that were not used for BagIdleStop
+					if idle > int64(BagIdleStop.Seconds()) {
+						t.forgetSite(s, info)
 						act.downloader.Close()
 						act.torrent.Stop()
-
 						log.Debug().Hex("bag_id", act.torrent.BagID).Msg("stopped unused bag")
+					}
+				case *rldpInfo:
+					// upstream never evicted RLDP sites: the map and their ADNL peers only grew
+					if idle > int64(SiteIdleEvict.Seconds()) && info.connecting == nil {
+						t.forgetSite(s, info)
+						if act.ActiveClient != nil {
+							act.ActiveClient.Close()
+						}
 					}
 				}
 				info.mx.Unlock()
 			}
 		}
 	}
+}
+
+func (t *Transport) forgetSite(host string, info *siteInfo) {
+	t.mx.Lock()
+	if t.activeSites[host] == info {
+		delete(t.activeSites, host)
+	}
+	t.mx.Unlock()
 }
 
 func (t *Transport) connectRLDP(key ed25519.PublicKey, addr, host string) (RLDP, error) {
@@ -259,102 +281,69 @@ func handleGetPart(req GetNextPayloadPart, stream *payloadStream) (*PayloadPart,
 	}, nil
 }
 
-func (s *siteInfo) prepare(t *Transport, request *http.Request) (err error) {
-	select {
-	case <-t.globalCtx.Done():
-		return t.globalCtx.Err()
-	default:
-	}
-
-	host := request.Host
-	if host == "" {
-		host = request.URL.Host
-	}
-
-	if s.Actor == nil || atomic.LoadInt64(&s.LastSuccess)+90 < time.Now().Unix() {
-		s.Actor, err = t.resolve(request.Context(), host)
-		if err != nil {
-			return err
-		}
-		// update success after resolve to not re-resolve too soon
-		atomic.StoreInt64(&s.LastSuccess, time.Now().Unix())
-		atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
-	}
-
-	switch act := s.Actor.(type) {
-	case *bagInfo:
-		atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
-	case *rldpInfo:
-		if act.ActiveClient != nil && atomic.LoadInt64(&s.LastUsed)+30 < time.Now().Unix() {
-			act.ActiveClient.GetADNL().(adnl.Peer).Reinit()
-			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
-		}
-
-		if act.ActiveClient == nil {
-			act.ActiveClient, err = t.connectRLDP(act.ID, act.Addr, host)
-			if err != nil {
-				// resolve again
-				s.Actor = nil
-				return s.prepare(t, request)
-			}
-			atomic.StoreInt64(&s.LastUsed, time.Now().Unix())
-		}
-	}
-	return nil
-}
-
 func (t *Transport) RoundTrip(request *http.Request) (_ *http.Response, err error) {
 	host := request.Host
 	if host == "" {
 		host = request.URL.Host
 	}
+	metrics.requests.Add(1)
 
-	t.mx.Lock()
-	site := t.activeSites[host]
-	if site == nil {
-		site = &siteInfo{
-			LastUsed: time.Now().Unix(),
-		}
-		t.activeSites[host] = site
-	}
-	t.mx.Unlock()
+	// Only a request we can safely send twice is retried after a stall.
+	retryable := (request.Method == http.MethodGet || request.Method == http.MethodHead) &&
+		(request.Body == nil || request.Body == http.NoBody)
 
-	var rldpClient RLDP
-	var torrent *bagInfo
-
-	tm := time.Now()
-	site.mx.Lock()
-	err = site.prepare(t, request)
-	log.Info().Str("host", host).Dur("took", time.Since(tm)).Msg("prepare took")
-
-	if err != nil {
-		site.mx.Unlock()
-		return nil, fmt.Errorf("failed to connect to site: %w", err)
-	}
-
-	switch act := site.Actor.(type) {
-	case *rldpInfo:
-		rldpClient = act.ActiveClient
-	case *bagInfo:
-		torrent = act
-	}
-	site.mx.Unlock()
-
-	if rldpClient != nil {
-		resp, err := t.doRldpHttp(rldpClient, host, request)
+	fresh := false
+	for attempt := 0; ; attempt++ {
+		tm := time.Now()
+		actor, err := t.actorFor(request.Context(), host, fresh)
 		if err != nil {
-			return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
+			return nil, fmt.Errorf("failed to connect to site: %w", err)
 		}
-		atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
-		return resp, nil
-	}
+		log.Debug().Str("host", host).Dur("took", time.Since(tm)).Msg("site ready")
 
-	resp, err := t.doTorrent(torrent, request, site)
-	if err != nil {
-		return nil, fmt.Errorf("failed to request file from storage: %w", err)
+		switch act := actor.(type) {
+		case *bagInfo:
+			metrics.bagRequests.Add(1)
+			s := t.site(host)
+			resp, err := t.doTorrent(act, request, s)
+			if err != nil {
+				return nil, fmt.Errorf("failed to request file from storage: %w", err)
+			}
+			atomic.StoreInt64(&s.LastSuccess, time.Now().Unix())
+			return resp, nil
+
+		case *rldpInfo:
+			client := act.ActiveClient
+			if client == nil { // dropped between actorFor and here
+				fresh = true
+				continue
+			}
+			resp, err := t.doRldpHttp(client, host, request)
+			if err == nil {
+				if attempt > 0 {
+					metrics.rldpRetryOK.Add(1)
+				}
+				metrics.rldpOK.Add(1)
+				atomic.StoreInt64(&t.site(host).LastSuccess, time.Now().Unix())
+				return resp, nil
+			}
+			if errors.Is(err, errStall) {
+				metrics.rldpStall.Add(1)
+				// The connection is not answering: forget it and its DHT address, then try
+				// once more from a fresh lookup (maybe the site moved, maybe the peer died).
+				t.dropClient(host, act, client)
+				if retryable && attempt == 0 && request.Context().Err() == nil {
+					fresh = true
+					continue
+				}
+			}
+			metrics.rldpFail.Add(1)
+			return nil, fmt.Errorf("failed to request rldp-http site: %w", err)
+
+		default:
+			return nil, fmt.Errorf("failed to connect to site: unknown actor %T", actor)
+		}
 	}
-	atomic.StoreInt64(&site.LastSuccess, time.Now().Unix())
-	return resp, nil
 }
 
 func (t *Transport) doTorrent(bag *bagInfo, request *http.Request, si *siteInfo) (*http.Response, error) {
@@ -537,7 +526,9 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		go func() {
 			defer request.Body.Close()
 
+			// local err: upstream wrote the enclosing function's err from this goroutine (data race)
 			var n int
+			var err error
 			for {
 				buf := make([]byte, 4096)
 				n, err = request.Body.Read(buf)
@@ -576,10 +567,17 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	var res Response
-	err = client.DoQuery(request.Context(), _RLDPMaxAnswerSize, req, &res)
+	tm := time.Now()
+	hctx, hcancel := context.WithTimeout(request.Context(), RLDPHeaderTimeout)
+	err = client.DoQuery(hctx, _RLDPMaxAnswerSize, req, &res)
+	hcancel()
 	if err != nil {
+		if request.Context().Err() == nil && errors.Is(hctx.Err(), context.DeadlineExceeded) {
+			return nil, errStall
+		}
 		return nil, fmt.Errorf("failed to query http over rldp: %w", err)
 	}
+	metrics.headerMs.Add(bucket(time.Since(tm)), 1)
 
 	httpResp := &http.Response{
 		Status:        res.Reason,
@@ -597,8 +595,9 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 		httpResp.Header.Add(header.Name, header.Value)
 	}
 
-	if ln, ok := request.Header["Content-Length"]; ok && len(ln) > 0 {
-		httpResp.ContentLength, err = strconv.ParseInt(ln[0], 10, 64)
+	// upstream read this from the REQUEST's headers, giving POST responses the request body's length
+	if ln := httpResp.Header.Get("Content-Length"); ln != "" {
+		httpResp.ContentLength, err = strconv.ParseInt(ln, 10, 64)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse content length: %w", err)
 		}
@@ -651,137 +650,6 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	return httpResp, nil
-}
-
-func (t *Transport) resolve(ctx context.Context, host string) (_ any, err error) {
-	var id []byte
-	var inStorage bool
-	if strings.HasSuffix(host, ".adnl") {
-		id, err = ParseADNLAddress(host[:len(host)-5])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse adnl address %s, err: %w", host, err)
-		}
-	} else if strings.HasSuffix(host, ".bag") {
-		id, err = hex.DecodeString(host[:len(host)-4])
-		if err != nil {
-			return nil, fmt.Errorf("failed to parse bag id %s, err: %w", host, err)
-		}
-		inStorage = true
-	} else {
-		tm := time.Now()
-		lookupCtx, stopLookup := context.WithCancel(ctx)
-		ch := make(chan *dns.Domain, 3)
-		for i := 0; i < 3; i++ { // do parallel lookup on diff nodes to speedup
-			go func(i int) {
-				for {
-					// each new thread has bigger timeout, to cover users with high ping
-					resolveCtx, cancel := context.WithTimeout(lookupCtx, time.Duration((i+1)*2)*time.Second)
-					domain, err := t.resolver.Resolve(resolveCtx, host)
-					cancel()
-					if err != nil {
-						if lookupCtx.Err() != nil {
-							return
-						}
-
-						if errors.Is(err, dns.ErrNoSuchRecord) {
-							ch <- nil
-							return
-						}
-						log.Error().Err(err).Str("domain", host).Msg("resolve error")
-						continue
-					}
-
-					ch <- domain
-					return
-				}
-			}(i)
-		}
-
-		var domain *dns.Domain
-		select {
-		case domain = <-ch:
-			stopLookup()
-			if domain == nil {
-				return nil, fmt.Errorf("domain %s resolve err: %w", host, dns.ErrNoSuchRecord)
-			}
-		case <-lookupCtx.Done():
-			stopLookup()
-			return nil, fmt.Errorf("failed to resolve domain %s in ton dns", host)
-		}
-		log.Info().Str("domain", host).Dur("duration", time.Since(tm)).Msg("resolve domain took")
-
-		id, inStorage = domain.GetSiteRecord()
-	}
-
-	if inStorage {
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("searching for bag id")
-
-		torrent := storage.NewTorrent("", t.store, t.storageConnector)
-		torrent.BagID = id
-
-		_ = t.store.SetTorrent(torrent)
-
-		if err = torrent.Start(true, false, false); err != nil {
-			return nil, fmt.Errorf("failed to start bag %s, err: %w", host, err)
-		}
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("starting for bag id")
-
-		downloader, err := t.storageConnector.CreateDownloader(t.globalCtx, torrent)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create downloader for storage bag of %s, err: %w", host, err)
-		}
-
-		log.Info().Str("bag_id", hex.EncodeToString(id)).Str("host", host).Msg("bag found")
-		return &bagInfo{
-			torrent:    torrent,
-			downloader: downloader,
-		}, nil
-	}
-
-	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("resolving ton site address")
-
-	addresses, pubKey, err := t.dht.FindAddresses(ctx, id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT, err: %w", host, hex.EncodeToString(id), err)
-	}
-
-	if len(addresses.Addresses) == 0 {
-		return nil, fmt.Errorf("failed to find address of %s (%s) in DHT,no addresses in record", host, hex.EncodeToString(id))
-	}
-
-	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Msg("server address resolved")
-
-	var addr string
-	var client RLDP
-	var triedAddresses []string
-	for _, v := range addresses.Addresses {
-		addr = fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
-
-		log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connecting to ton site")
-
-		// find working rldp node addr
-		client, err = t.connectRLDP(pubKey, addr, host)
-		if err != nil {
-			log.Error().Err(err).Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connection failed")
-
-			triedAddresses = append(triedAddresses, addr)
-			continue
-		}
-
-		break
-	}
-	if err != nil {
-		return nil, fmt.Errorf("failed to connect to rldp servers %s of host %s, err: %w", triedAddresses, host, err)
-	}
-
-	log.Info().Str("host", host).Str("node", hex.EncodeToString(id)).Str("address", addr).Msg("connected to server")
-
-	info := &rldpInfo{
-		ActiveClient: client,
-		ID:           pubKey,
-		Addr:         addr,
-	}
-	return info, nil
 }
 
 func (t *Transport) proxyOrdered(ctx context.Context, file *storage.FileInfo,

@@ -124,7 +124,9 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	resp, err := c.Do(req)
 	if err != nil {
 		text := err.Error()
-		if strings.Contains(text, "context deadline exceeded") {
+		// ton2web fork: say why, so the gateway can tell our own failure from the site's
+		wr.Header().Set("X-Tonutils-Error", errorKind(text))
+		if strings.Contains(text, "context deadline exceeded") || strings.Contains(text, "no response header in time") {
 			http.Error(wr, "TON Site "+req.URL.Host+" is not responding.", http.StatusBadGateway)
 		} else {
 			http.Error(wr, "RLDP Proxy Error:\n"+text, http.StatusBadGateway)
@@ -141,6 +143,28 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
 	io.Copy(wr, resp.Body)
+}
+
+// errorKind classifies a transport error for the X-Tonutils-Error header.
+func errorKind(text string) string {
+	switch {
+	case strings.Contains(text, "no response header in time"):
+		return "stall" // connected, but the site did not answer (after one fresh retry)
+	case strings.Contains(text, "no such dns record") || strings.Contains(text, "resolve err"):
+		return "no-record" // the name has no site record
+	case strings.Contains(text, "resolve domain"):
+		return "resolve" // our DNS lookup failed
+	case strings.Contains(text, "in DHT"):
+		return "dht" // the site's address is not in the DHT
+	case strings.Contains(text, "storage"):
+		return "storage"
+	case strings.Contains(text, "context canceled"):
+		return "canceled"
+	case strings.Contains(text, "deadline exceeded"):
+		return "timeout"
+	default:
+		return "other"
+	}
 }
 
 type State struct {

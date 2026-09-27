@@ -2,14 +2,19 @@ package main
 
 import (
 	"context"
+	"expvar"
 	"flag"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"github.com/xssnick/tonutils-go/liteclient"
 	"github.com/xssnick/tonutils-proxy/cmd/proxy-cli/config"
 	"github.com/xssnick/tonutils-proxy/proxy"
+	"github.com/xssnick/tonutils-proxy/proxy/transport"
+	"net/http"
+	"net/http/pprof"
 	"os"
 	"os/signal"
+	"time"
 )
 
 var GitCommit = "dev"
@@ -19,8 +24,19 @@ func main() {
 	var verbosity = flag.Int("verbosity", 2, "Debug logs")
 	var blockHttp = flag.Bool("no-http", false, "Block ordinary http requests")
 	var networkConfigPath = flag.String("global-config", "", "path to ton network config file")
+	// ton2web fork
+	var debugAddr = flag.String("debug-addr", "", "serve /debug/vars and /debug/pprof on this addr (keep it on localhost)")
+	var headerTimeout = flag.Duration("rldp-header-timeout", transport.RLDPHeaderTimeout, "drop an RLDP connection that sends no response header within this, and retry once")
+	var storageUpload = flag.Bool("storage-upload", transport.StorageUpload, "seed TON Storage bags that were visited")
+	var siteIdle = flag.Duration("site-idle", transport.SiteIdleEvict, "forget an RLDP site unused for this long")
+	var bagIdle = flag.Duration("bag-idle", transport.BagIdleStop, "stop a storage bag unused for this long")
 
 	flag.Parse()
+
+	transport.RLDPHeaderTimeout = *headerTimeout
+	transport.StorageUpload = *storageUpload
+	transport.SiteIdleEvict = *siteIdle
+	transport.BagIdleStop = *bagIdle
 
 	log.Logger = log.Output(zerolog.ConsoleWriter{Out: os.Stdout}).Level(zerolog.InfoLevel)
 	if *verbosity >= 3 {
@@ -28,6 +44,23 @@ func main() {
 	}
 
 	log.Info().Msg("Version:" + GitCommit)
+
+	if *debugAddr != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/debug/vars", expvar.Handler())
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		go func() {
+			srv := &http.Server{Addr: *debugAddr, Handler: mux, ReadHeaderTimeout: 5 * time.Second}
+			log.Info().Str("addr", *debugAddr).Msg("debug endpoint")
+			if err := srv.ListenAndServe(); err != nil {
+				log.Error().Err(err).Msg("debug endpoint failed")
+			}
+		}()
+	}
 	if *blockHttp {
 		log.Info().Msg("Ordinary HTTP Will be blocked (flag --no-http set)")
 	}
