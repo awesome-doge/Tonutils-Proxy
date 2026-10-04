@@ -143,7 +143,16 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 
 	copyHeader(wr.Header(), resp.Header)
 	wr.WriteHeader(resp.StatusCode)
-	io.Copy(wr, resp.Body)
+	if _, err := io.Copy(wr, resp.Body); err != nil {
+		// ton2web: the body stopped before its end (the site's server went away, or a payload
+		// part never came). Returning here would let net/http finish the response as if it were
+		// whole — for a body without a Content-Length that is a clean, complete-looking answer,
+		// and a gateway's cache keeps the cut file (measured 2026-10-04: a 200,000-byte script cut
+		// at 50,000 arrived as "200, 50,000 bytes, no error" and was stored for 24 hours).
+		// Aborting closes the connection without the final chunk, so every reader can tell.
+		log.Warn().Str("err", err.Error()).Str("method", req.Method).Str("url", req.URL.String()).Msg("body cut short")
+		panic(http.ErrAbortHandler)
+	}
 }
 
 // errorKind classifies a transport error for the X-Tonutils-Error header. It looks at the
