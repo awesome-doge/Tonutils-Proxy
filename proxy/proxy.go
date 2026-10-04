@@ -151,6 +151,13 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		// at 50,000 arrived as "200, 50,000 bytes, no error" and was stored for 24 hours).
 		// Aborting closes the connection without the final chunk, so every reader can tell.
 		log.Warn().Str("err", err.Error()).Str("method", req.Method).Str("url", req.URL.String()).Msg("body cut short")
+		// Headers first: when not one byte of the body came, nothing has been sent yet, and an
+		// abort now would look like this proxy dying ("socket hang up") — the gateway's bridge
+		// would count the site's failure as its own. With the status line out, what follows is
+		// plainly a response that stopped.
+		if f, ok := wr.(http.Flusher); ok {
+			f.Flush()
+		}
 		panic(http.ErrAbortHandler)
 	}
 }

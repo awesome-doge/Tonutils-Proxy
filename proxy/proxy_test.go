@@ -114,6 +114,15 @@ func TestACutBodyIsNotPassedOffAsWhole(t *testing.T) {
 		t.Fatalf("Content-Length 200000, cut after %d bytes: the client read %d bytes and no error", len(part), n)
 	}
 
+	// Not one byte of the body: the status line must still arrive (through() fails the test when
+	// the request itself errors), so the reader sees a response that stopped — not a dead proxy.
+	for _, length := range []int64{-1, 200000} {
+		n, err = through(t, bodyRT{body: &cutBody{done: true}, length: length})
+		if err == nil || n != 0 {
+			t.Fatalf("no body at all (length %d): read %d bytes, err %v — want 0 bytes and an error", length, n, err)
+		}
+	}
+
 	// and a whole body is still a whole body, with and without a length
 	for _, length := range []int64{-1, 50000} {
 		n, err = through(t, bodyRT{body: io.NopCloser(bytes.NewReader(part)), length: length})
