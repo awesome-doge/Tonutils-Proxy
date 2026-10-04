@@ -172,6 +172,15 @@ func (t *Transport) startDNSFlightLocked(host string) *flight {
 	return f
 }
 
+type dnsAttemptKey struct{}
+
+// DNSAttempt tells a Resolver which of a lookup's staggered attempts ctx belongs to (0 = the
+// first), so that a later attempt can ask differently than the one that is failing.
+func DNSAttempt(ctx context.Context) int {
+	i, _ := ctx.Value(dnsAttemptKey{}).(int)
+	return i
+}
+
 // resolveDNS runs up to three staggered attempts (a hedge against one slow liteserver); the
 // first answer wins and cancels the rest. An attempt that fails early starts the next one at once.
 func (t *Transport) resolveDNS(ctx context.Context, host string) (*dns.Domain, error) {
@@ -189,7 +198,7 @@ func (t *Transport) resolveDNS(ctx context.Context, host string) (*dns.Domain, e
 		i := launched
 		launched++
 		go func() {
-			actx, acancel := context.WithTimeout(ctx, dnsAttemptTimeouts[i])
+			actx, acancel := context.WithTimeout(context.WithValue(ctx, dnsAttemptKey{}, i), dnsAttemptTimeouts[i])
 			d, err := t.resolver.Resolve(actx, host)
 			acancel()
 			res <- result{d, err}

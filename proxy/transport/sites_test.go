@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -501,4 +502,33 @@ func TestAStallOnASharedServerReconnectsItsSitesOnce(t *testing.T) {
 	if dials.Load() != 2 {
 		t.Fatalf("dials = %d; want 2 (the dead client once, the new one shared)", dials.Load())
 	}
+}
+
+// Each of a lookup's staggered attempts tells the resolver which one it is, so that a later
+// attempt can ask at an older block than the one that is failing.
+func TestEveryDNSAttemptSaysWhichOneItIs(t *testing.T) {
+	if got := DNSAttempt(context.Background()); got != 0 {
+		t.Fatalf("no attempt in the context reads as the first, got %d", got)
+	}
+	var mx sync.Mutex
+	var seen []int
+	tr := &Transport{resolver: resolverFunc(func(ctx context.Context, host string) (*dns.Domain, error) {
+		mx.Lock()
+		seen = append(seen, DNSAttempt(ctx))
+		mx.Unlock()
+		return nil, errors.New("lite server error, code 651")
+	})}
+	if _, err := tr.resolveDNS(context.Background(), "x.ton"); err == nil {
+		t.Fatal("every attempt failed: an error")
+	}
+	sort.Ints(seen)
+	if len(seen) != 3 || seen[0] != 0 || seen[1] != 1 || seen[2] != 2 {
+		t.Fatalf("want attempts 0, 1, 2; got %v", seen)
+	}
+}
+
+type resolverFunc func(ctx context.Context, host string) (*dns.Domain, error)
+
+func (f resolverFunc) Resolve(ctx context.Context, host string) (*dns.Domain, error) {
+	return f(ctx, host)
 }
