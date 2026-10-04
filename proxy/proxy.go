@@ -6,6 +6,7 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"errors"
+	"expvar"
 	"fmt"
 	"github.com/rs/zerolog/log"
 	tunnelConfig "github.com/ton-blockchain/adnl-tunnel/config"
@@ -150,7 +151,18 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		// and a gateway's cache keeps the cut file (measured 2026-10-04: a 200,000-byte script cut
 		// at 50,000 arrived as "200, 50,000 bytes, no error" and was stored for 24 hours).
 		// Aborting closes the connection without the final chunk, so every reader can tell.
-		log.Warn().Str("err", err.Error()).Str("method", req.Method).Str("url", req.URL.String()).Msg("body cut short")
+		// Two different things end up here, and they used to share one log line (55 lines in 17
+		// minutes on 2026-10-04: 36 of the first kind, 19 of the second):
+		//   - the site's body stopped — worth a warning;
+		//   - the reader went away first (the gateway's keep-warm hangs up after the headers; a
+		//     visitor closes the tab) — routine, counted but not warned about.
+		if leftByReader(err, req.Context().Err()) {
+			readerLeft.Add(1)
+			log.Debug().Str("err", err.Error()).Str("method", req.Method).Str("url", req.URL.String()).Msg("reader left before the body ended")
+		} else {
+			bodyCutShort.Add(1)
+			log.Warn().Str("err", err.Error()).Str("method", req.Method).Str("url", req.URL.String()).Msg("body cut short")
+		}
 		// Headers first: when not one byte of the body came, nothing has been sent yet, and an
 		// abort now would look like this proxy dying ("socket hang up") — the gateway's bridge
 		// would count the site's failure as its own. With the status line out, what follows is
@@ -160,6 +172,21 @@ func (p *proxy) ServeHTTP(wr http.ResponseWriter, req *http.Request) {
 		}
 		panic(http.ErrAbortHandler)
 	}
+}
+
+var (
+	bodyCutShort = expvar.NewInt("body_cut_short") // the site's body stopped before its end
+	readerLeft   = expvar.NewInt("reader_left")    // the reader closed the connection first
+)
+
+// leftByReader tells a copy that failed because the READER went away (a write to its connection
+// failed, or its request was cancelled) from one that failed because the site's body stopped.
+func leftByReader(copyErr, requestCtxErr error) bool {
+	if requestCtxErr != nil {
+		return true // net/http cancels the request's context when the client's connection closes
+	}
+	var op *net.OpError
+	return errors.As(copyErr, &op) && op.Op == "write"
 }
 
 // errorKind classifies a transport error for the X-Tonutils-Error header. It looks at the

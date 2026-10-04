@@ -2,9 +2,11 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -129,5 +131,26 @@ func TestACutBodyIsNotPassedOffAsWhole(t *testing.T) {
 		if err != nil || n != len(part) {
 			t.Fatalf("whole body (length %d): read %d bytes, err %v", length, n, err)
 		}
+	}
+}
+
+// The two ways a body copy fails are told apart: the reader leaving is routine (the gateway's
+// keep-warm hangs up after the headers), the site's body stopping is not.
+func TestAReaderThatLeftIsNotASiteWhoseBodyStopped(t *testing.T) {
+	writeErr := &net.OpError{Op: "write", Net: "tcp", Err: errors.New("broken pipe")}
+	if !leftByReader(writeErr, nil) {
+		t.Fatal("a failed write to the reader's connection: the reader left")
+	}
+	if !leftByReader(fmt.Errorf("copy: %w", writeErr), nil) {
+		t.Fatal("the same, wrapped")
+	}
+	if !leftByReader(errors.New("context canceled"), context.Canceled) {
+		t.Fatal("the request was cancelled: the reader left")
+	}
+	if leftByReader(io.ErrUnexpectedEOF, nil) {
+		t.Fatal("the body ended early while the reader was still there: the site's body stopped")
+	}
+	if leftByReader(&net.OpError{Op: "read", Net: "udp", Err: errors.New("timeout")}, nil) {
+		t.Fatal("a failed read is the site's side")
 	}
 }
