@@ -502,9 +502,14 @@ func (t *Transport) doRldpHttp(client RLDP, host string, request *http.Request) 
 	}
 
 	req := Request{
-		ID:      qid,
-		Method:  request.Method,
-		URL:     request.URL.String(),
+		ID:     qid,
+		Method: request.Method,
+		// ton2web: the path and query only. A request that came with a Host header and a bare path
+		// (how a reverse proxy in front of this one asks) has no host in its URL, and URL.String()
+		// then wrote "http:///path": a server that hands that to nginx as the request target gets
+		// 400 Bad Request back. The whole address ("http://name.ton/path") is no better: one live
+		// site answered 404 to it and 200 to the path. The host travels in the Host header.
+		URL:     request.URL.RequestURI(),
 		Version: "HTTP/1.1",
 		Headers: []Header{
 			{
