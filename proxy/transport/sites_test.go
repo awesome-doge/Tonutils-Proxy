@@ -52,7 +52,7 @@ type fakeDHT struct {
 	addrs []string
 }
 
-func (d *fakeDHT) StoreAddress(context.Context, address.List, time.Duration, ed25519.PrivateKey, int) (int, []byte, error) {
+func (d *fakeDHT) StoreAddress(context.Context, address.List, time.Duration, ed25519.PrivateKey) (int, []byte, error) {
 	return 0, nil, nil
 }
 func (d *fakeDHT) FindAddresses(ctx context.Context, id []byte) (*address.List, ed25519.PublicKey, error) {

@@ -519,7 +519,7 @@ func (t *Transport) connect(ctx context.Context, host string, old any, fresh boo
 	start := 0
 	if prev, ok := old.(*rldpInfo); ok && fresh && len(list.Addresses) > 1 {
 		for i, v := range list.Addresses {
-			if fmt.Sprintf("%s:%d", v.IP.String(), v.Port) == prev.Addr {
+			if fmt.Sprintf("%s:%d", address.IPValue(v).String(), address.PortValue(v)) == prev.Addr {
 				start = (i + 1) % len(list.Addresses)
 			}
 		}
@@ -528,7 +528,7 @@ func (t *Transport) connect(ctx context.Context, host string, old any, fresh boo
 	var tried []string
 	for i := 0; i < len(list.Addresses); i++ {
 		v := list.Addresses[(start+i)%len(list.Addresses)]
-		addr := fmt.Sprintf("%s:%d", v.IP.String(), v.Port)
+		addr := fmt.Sprintf("%s:%d", address.IPValue(v).String(), address.PortValue(v))
 		sc, cerr := t.serverFor(pubKey, addr, host)
 		if cerr != nil {
 			tried = append(tried, addr)

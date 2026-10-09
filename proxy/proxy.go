@@ -347,8 +347,8 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 					log.Info().Msg("tunnel updated")
 
 					e.Tunnel.SetOutAddressChangedHandler(func(addr *net.UDPAddr) {
-						gate.SetAddressList([]*adnlAddress.UDP{
-							{
+						gate.SetAddressList([]adnlAddress.Address{
+							&adnlAddress.UDP{
 								IP:   addr.IP,
 								Port: int32(addr.Port),
 							},
@@ -379,8 +379,8 @@ func RunProxyWithConfig(closerCtx context.Context, addr string, adnlKey ed25519.
 						default:
 						}
 					} else {
-						gate.SetAddressList([]*adnlAddress.UDP{
-							{
+						gate.SetAddressList([]adnlAddress.Address{
+							&adnlAddress.UDP{
 								IP:   e.ExtIP,
 								Port: int32(e.ExtPort),
 							},
