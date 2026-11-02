@@ -235,6 +235,29 @@ func TestNoSuchRecordIsRemembered(t *testing.T) {
 	}
 }
 
+func TestNameWithoutSiteRecordIsNoSuchRecord(t *testing.T) {
+	r := &fakeResolver{fn: func(context.Context, int32) (*dns.Domain, error) {
+		return &dns.Domain{Records: cell.NewDict(256)}, nil // a name with no records at all
+	}}
+	dht := &fakeDHT{}
+	tr := newTestTransport(r, dht)
+	defer tr.stop()
+	for i := 0; i < 3; i++ {
+		if _, err := tr.lookup(context.Background(), "wallet-only.ton"); !errors.Is(err, dns.ErrNoSuchRecord) {
+			t.Fatalf("want ErrNoSuchRecord, got %v", err)
+		}
+	}
+	if _, err := tr.connect(context.Background(), "wallet-only.ton", nil, false); !errors.Is(err, dns.ErrNoSuchRecord) {
+		t.Fatalf("connect: want ErrNoSuchRecord, got %v", err)
+	}
+	if n := r.calls.Load(); n != 1 {
+		t.Fatalf("resolver calls = %d, want 1", n)
+	}
+	if n := dht.calls.Load(); n != 0 {
+		t.Fatalf("DHT calls = %d, want 0: there is no address to look up", n)
+	}
+}
+
 // ---- connecting ----
 
 func TestOneConnectForManyConcurrentRequests(t *testing.T) {

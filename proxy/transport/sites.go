@@ -157,6 +157,14 @@ func (t *Transport) startDNSFlightLocked(host string) *flight {
 		switch {
 		case err == nil:
 			id, inStorage := domain.GetSiteRecord()
+			if len(id) == 0 {
+				// The name exists but has no site record (a wallet or subdomains only), or one
+				// that does not parse. That is "no such record", not a DHT lookup with an empty
+				// key: those failed as "dht" ("key should have 256 bits"), 71% of all connect
+				// failures on 2026-11-01, and visitors were told the server did not answer.
+				t.dns.entries[host] = &dnsRecord{notFound: true, at: time.Now()}
+				break
+			}
 			t.dns.entries[host] = &dnsRecord{id: id, inStorage: inStorage, at: time.Now()}
 		case errors.Is(err, dns.ErrNoSuchRecord):
 			t.dns.entries[host] = &dnsRecord{notFound: true, at: time.Now()}
